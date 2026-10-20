@@ -1,0 +1,561 @@
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <memory>
+#include <cctype>
+
+// ================================================
+// 1. HTML DOM 节点
+// text 只保存当前元素直接包含的文本，
+// 不包含子元素内部的文本。
+// ================================================
+struct HtmlNode {
+    std::string tag;
+    std::string attributes;
+    std::string text;
+    std::vector<std::shared_ptr<HtmlNode>> children;
+
+    HtmlNode(const std::string& t = "")
+        : tag(t) {}
+};
+
+// ================================================
+// 2. 多叉树节点
+// ================================================
+struct TreeNode {
+    std::string name;
+    std::string innerText;
+    std::vector<std::shared_ptr<TreeNode>> children;
+
+    TreeNode(const std::string& n = "",
+             const std::string& txt = "")
+        : name(n), innerText(txt) {}
+};
+
+// ================================================
+// 3. 去除首尾空白，并将连续空白压缩成一个空格
+// ================================================
+std::string normalizeText(const std::string& input) {
+    std::string result;
+    bool pendingSpace = false;
+
+    for (unsigned char c : input) {
+        if (std::isspace(c)) {
+            if (!result.empty()) {
+                pendingSpace = true;
+            }
+        } else {
+            if (pendingSpace) {
+                result += ' ';
+                pendingSpace = false;
+            }
+            result += static_cast<char>(c);
+        }
+    }
+
+    return result;
+}
+
+// ================================================
+// 4. 从属性字符串中读取指定属性值
+// 支持 class="a_1 b_1" 和 class='a_1 b_1'
+// ================================================
+std::string getAttribute(
+    const std::string& attrs,
+    const std::string& wanted
+) {
+    std::size_t i = 0;
+
+    while (i < attrs.size()) {
+        while (i < attrs.size() &&
+               (std::isspace(
+                    static_cast<unsigned char>(attrs[i])) ||
+                attrs[i] == '/')) {
+            ++i;
+        }
+
+        std::size_t start = i;
+
+        while (i < attrs.size() &&
+               !std::isspace(
+                    static_cast<unsigned char>(attrs[i])) &&
+               attrs[i] != '=' &&
+               attrs[i] != '/') {
+            ++i;
+        }
+
+        if (start == i) {
+            ++i;
+            continue;
+        }
+
+        std::string name = attrs.substr(start, i - start);
+
+        while (i < attrs.size() &&
+               std::isspace(
+                   static_cast<unsigned char>(attrs[i]))) {
+            ++i;
+        }
+
+        std::string value;
+
+        if (i < attrs.size() && attrs[i] == '=') {
+            ++i;
+
+            while (i < attrs.size() &&
+                   std::isspace(
+                       static_cast<unsigned char>(attrs[i]))) {
+                ++i;
+            }
+
+            if (i < attrs.size() &&
+                (attrs[i] == '"' || attrs[i] == '\'')) {
+                char quote = attrs[i++];
+                start = i;
+
+                while (i < attrs.size() && attrs[i] != quote) {
+                    ++i;
+                }
+
+                value = attrs.substr(start, i - start);
+
+                if (i < attrs.size()) {
+                    ++i;
+                }
+            } else {
+                start = i;
+
+                while (i < attrs.size() &&
+                       !std::isspace(
+                           static_cast<unsigned char>(attrs[i])) &&
+                       attrs[i] != '/') {
+                    ++i;
+                }
+
+                value = attrs.substr(start, i - start);
+            }
+        }
+
+        if (name == wanted) {
+            return value;
+        }
+    }
+
+    return "";
+}
+
+// ================================================
+// 5. 精确匹配 class 中的关键词
+// 例如 class="a_1 item" 能匹配 a_1，
+// 但不能把 a_10 错误匹配为 a_1。
+// ================================================
+bool hasClass(
+    const std::shared_ptr<HtmlNode>& node,
+    const std::string& keyword
+) {
+    if (!node) return false;
+
+    std::string classes = getAttribute(
+        node->attributes, "class"
+    );
+
+    std::size_t i = 0;
+
+    while (i < classes.size()) {
+        while (i < classes.size() &&
+               std::isspace(
+                   static_cast<unsigned char>(classes[i]))) {
+            ++i;
+        }
+
+        std::size_t start = i;
+
+        while (i < classes.size() &&
+               !std::isspace(
+                   static_cast<unsigned char>(classes[i]))) {
+            ++i;
+        }
+
+        if (classes.substr(start, i - start) == keyword) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ================================================
+// 6. 简易 HTML 解析器
+// 仅适用于结构规整、标签闭合的 HTML。
+// ================================================
+std::shared_ptr<HtmlNode> parseHTML(
+    const std::string& html
+) {
+    auto document = std::make_shared<HtmlNode>("document");
+
+    std::vector<std::shared_ptr<HtmlNode>> stack = {
+        document
+    };
+
+    const std::vector<std::string> voidTags = {
+        "area", "base", "br", "col", "embed",
+        "hr", "img", "input", "link", "meta",
+        "param", "source", "track", "wbr"
+    };
+
+    std::size_t i = 0;
+
+    while (i < html.size()) {
+        // 跳过注释
+        if (html.compare(i, 4, "<!--") == 0) {
+            std::size_t end = html.find("-->", i + 4);
+
+            if (end == std::string::npos) break;
+
+            i = end + 3;
+            continue;
+        }
+
+        // 处理标签
+        if (html[i] == '<') {
+            std::size_t end = html.find('>', i + 1);
+
+            if (end == std::string::npos) break;
+
+            std::string token = html.substr(
+                i + 1, end - i - 1
+            );
+
+            i = end + 1;
+
+            if (token.empty() ||
+                token[0] == '!' ||
+                token[0] == '?') {
+                continue;
+            }
+
+            // 结束标签：回退到对应的父节点
+            if (token[0] == '/') {
+                std::size_t p = 1;
+
+                while (p < token.size() &&
+                       std::isspace(
+                           static_cast<unsigned char>(token[p]))) {
+                    ++p;
+                }
+
+                std::size_t start = p;
+
+                while (p < token.size() &&
+                       !std::isspace(
+                           static_cast<unsigned char>(token[p]))) {
+                    ++p;
+                }
+
+                std::string closingTag =
+                    token.substr(start, p - start);
+
+                for (char& c : closingTag) {
+                    c = static_cast<char>(
+                        std::tolower(
+                            static_cast<unsigned char>(c)
+                        )
+                    );
+                }
+
+                for (std::size_t j = stack.size(); j > 1; --j) {
+                    if (stack[j - 1]->tag == closingTag) {
+                        stack.resize(j - 1);
+                        break;
+                    }
+                }
+
+                continue;
+            }
+
+            // 提取开始标签的名称
+            std::size_t p = 0;
+
+            while (p < token.size() &&
+                   !std::isspace(
+                       static_cast<unsigned char>(token[p])) &&
+                   token[p] != '/') {
+                ++p;
+            }
+
+            std::string tag = token.substr(0, p);
+
+            for (char& c : tag) {
+                c = static_cast<char>(
+                    std::tolower(
+                        static_cast<unsigned char>(c)
+                    )
+                );
+            }
+
+            std::string attrs = token.substr(p);
+
+            auto node = std::make_shared<HtmlNode>(tag);
+            node->attributes = attrs;
+
+            stack.back()->children.push_back(node);
+
+            // 判断是否为自闭合标签
+            std::size_t last = token.find_last_not_of(" \t\r\n");
+            bool selfClosing =
+                last != std::string::npos && token[last] == '/';
+
+            bool isVoid = false;
+
+            for (const auto& v : voidTags) {
+                if (tag == v) {
+                    isVoid = true;
+                    break;
+                }
+            }
+
+            if (!selfClosing && !isVoid) {
+                stack.push_back(node);
+            }
+        } else {
+            // 只保存当前元素直接包含的文本
+            std::size_t end = html.find('<', i);
+
+            if (end == std::string::npos) {
+                end = html.size();
+            }
+
+            stack.back()->text += html.substr(i, end - i);
+            i = end;
+        }
+    }
+
+    return document;
+}
+
+// ================================================
+// 7. 获取元素的直接文本
+// 不递归，不包含任何子元素的文本。
+// ================================================
+std::string getOwnText(
+    const std::shared_ptr<HtmlNode>& node
+) {
+    if (!node) return "";
+
+    return normalizeText(node->text);
+}
+
+// ================================================
+// 8. 找到 rowgroup
+// ================================================
+std::shared_ptr<HtmlNode> findRowgroup(
+    const std::shared_ptr<HtmlNode>& node
+) {
+    if (!node) return nullptr;
+
+    if (hasClass(node, "rowgroup")) {
+        return node;
+    }
+
+    for (const auto& child : node->children) {
+        auto found = findRowgroup(child);
+
+        if (found) return found;
+    }
+
+    return nullptr;
+}
+
+// ================================================
+// 9. 搜索 b 节点并输出
+// 每个 b 节点只输出自身直接文本。
+// 即使 b 节点里面还有 b 节点，也继续递归。
+// ================================================
+void extractBNodes(
+    const std::shared_ptr<HtmlNode>& node,
+    const std::string& aName,
+    const std::vector<std::string>& bKeywords,
+    std::ofstream& out,
+    const std::shared_ptr<TreeNode>& aTree
+) {
+    if (!node) return;
+
+    for (const auto& child : node->children) {
+        std::string matchedB;
+
+        for (const auto& keyword : bKeywords) {
+            if (hasClass(child, keyword)) {
+                matchedB = keyword;
+                break;
+            }
+        }
+
+        if (!matchedB.empty()) {
+            // 只获取 b 元素自己的直接文本
+            std::string ownText = getOwnText(child);
+
+            // 构建多叉树节点
+            auto bTree = std::make_shared<TreeNode>(
+                matchedB, ownText
+            );
+
+            aTree->children.push_back(bTree);
+
+            // 输出所属 a 和 b 的名称
+            out << aName << "\n";
+            out << "  " << matchedB << ": "
+                << ownText << "\n\n";
+        }
+
+        // 无论当前元素是否为 b，都继续向下搜索。
+        // 因此嵌套 b 节点也会被单独提取。
+        extractBNodes(
+            child, aName, bKeywords, out, aTree
+        );
+    }
+}
+
+// ================================================
+// 10. 在 rowgroup 下寻找 a 节点
+// ================================================
+void extractANodes(
+    const std::shared_ptr<HtmlNode>& node,
+    const std::vector<std::string>& aKeywords,
+    const std::vector<std::string>& bKeywords,
+    std::ofstream& out,
+    const std::shared_ptr<TreeNode>& root
+) {
+    if (!node) return;
+
+    for (const auto& child : node->children) {
+        std::string matchedA;
+
+        for (const auto& keyword : aKeywords) {
+            if (hasClass(child, keyword)) {
+                matchedA = keyword;
+                break;
+            }
+        }
+
+        if (!matchedA.empty()) {
+            // 创建 a 节点
+            auto aTree = std::make_shared<TreeNode>(
+                matchedA, ""
+            );
+
+            root->children.push_back(aTree);
+
+            // 在当前 a 节点中查找所有 b 节点
+            extractBNodes(
+                child, matchedA, bKeywords, out, aTree
+            );
+
+            // 当前 a 已处理，不再把其内部的 a
+            // 错误地归入 rowgroup 的直接子节点。
+        } else {
+            // 允许 a 节点外面存在普通 HTML 包装元素
+            extractANodes(
+                child, aKeywords, bKeywords, out, root
+            );
+        }
+    }
+}
+
+// ================================================
+// 11. 打印多叉树，方便检查结构
+// ================================================
+void printTree(
+    const std::shared_ptr<TreeNode>& node,
+    int depth = 0
+) {
+    if (!node) return;
+
+    std::cout << std::string(depth * 2, ' ')
+              << node->name;
+
+    if (!node->innerText.empty()) {
+        std::cout << " : " << node->innerText;
+    }
+
+    std::cout << '\n';
+
+    for (const auto& child : node->children) {
+        printTree(child, depth + 1);
+    }
+}
+
+// ================================================
+// 12. 主程序
+// ================================================
+int main() {
+    const std::string html = R"HTML(
+    <div class="rowgroup">
+        <div class="a_1">
+            <div class="b_1">
+                第一段文本
+                <div class="b_2">第二段文本</div>
+                第一段后续文本
+            </div>
+
+            <div class="b_2">第三段文本</div>
+        </div>
+
+        <div class="a_2">
+            <div class="b_1">第四段文本</div>
+        </div>
+
+        <div class="a_3">
+            <div class="b_2">第五段文本</div>
+        </div>
+    </div>
+    )HTML";
+
+    // 关键词列表：可按实际 HTML 修改
+    const std::vector<std::string> aKeywords = {
+        "a_1", "a_2", "a_3"
+    };
+
+    const std::vector<std::string> bKeywords = {
+        "b_1", "b_2"
+    };
+
+    // 解析 HTML
+    auto document = parseHTML(html);
+
+    // 找到 rowgroup
+    auto rowgroup = findRowgroup(document);
+
+    if (!rowgroup) {
+        std::cerr << "未找到 rowgroup\n";
+        return 1;
+    }
+
+    // 创建最终的多叉树
+    auto root = std::make_shared<TreeNode>(
+        "rowgroup", ""
+    );
+
+    // 打开 TXT 文件
+    std::ofstream out("result.txt");
+
+    if (!out) {
+        std::cerr << "无法创建 result.txt\n";
+        return 1;
+    }
+
+    // 遍历 a 和 b 节点，构建树并输出 TXT
+    extractANodes(
+        rowgroup, aKeywords, bKeywords, out, root
+    );
+
+    out.close();
+
+    // 输出多叉树供检查
+    printTree(root);
+
+    std::cout << "\n提取完成，结果已写入 result.txt\n";
+
+    return 0;
+}
