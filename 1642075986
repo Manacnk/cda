@@ -490,27 +490,16 @@ void printTree(
 // 12. 主程序
 // ================================================
 int main() {
-    const std::string html = R"HTML(
-    <div class="rowgroup">
-        <div class="a_1">
-            <div class="b_1">
-                第一段文本
-                <div class="b_2">第二段文本</div>
-                第一段后续文本
-            </div>
+    const std::string html = [&]() {
+    std::ifstream file("data.html");
+    if (!file) {
+        throw std::runtime_error("无法打开 data.html");
+    }
 
-            <div class="b_2">第三段文本</div>
-        </div>
-
-        <div class="a_2">
-            <div class="b_1">第四段文本</div>
-        </div>
-
-        <div class="a_3">
-            <div class="b_2">第五段文本</div>
-        </div>
-    </div>
-    )HTML";
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}();
 
     // 关键词列表：可按实际 HTML 修改
     const std::vector<std::string> aKeywords = {
