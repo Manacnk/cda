@@ -1,0 +1,237 @@
+// C++17 教学版：读取 HTML -> 建立多叉树 -> 提取文本。
+// 支持显式匹配的标签、属性、注释、常见无结束标签。
+// 不实现实体解码、CSS、浏览器的自动补全/纠错或完整 innerText 规则。
+#include <cctype>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <stack>
+#include <stdexcept>
+#include <string>
+#include <vector>
+using namespace std;
+
+struct Node {
+    string tag;  // 标签名；文本节点用 #text，虚拟根节点用 #document
+    string text;
+    map<string, string> attributes;  // 属性名 -> 属性值，仅标签节点使用
+    vector<unique_ptr<Node>> children;  // 一个节点可以有任意多个孩子
+    explicit Node(string name) : tag(name) {}
+};
+
+string lowerAscii(string s) {
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    return s;
+}
+
+// 在引号外寻找 >，避免把 title="a > b" 中的 > 当作标签结尾。
+size_t tagEnd(const string& html, size_t start) {
+    char quote = 0;
+    for (size_t j = start + 1; j < html.size(); ++j) {
+        char c = html[j];
+        if (quote) {
+            if (c == quote) quote = 0;
+        } else if (c == '\'' || c == '"') {
+            quote = c;
+        } else if (c == '>') {
+            return j;
+        }
+    }
+    throw runtime_error("Unclosed tag");
+}
+
+// pos 从标签名后面开始；保存属性，并返回是否有独立的自闭合 /。
+bool parseAttributes(const string& inside, size_t pos,
+                     map<string, string>& attributes) {
+    auto skipSpaces = [&]() {
+        while (pos < inside.size() &&
+               isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
+    };
+    while (true) {
+        skipSpaces();
+        if (pos == inside.size()) return false;
+        if (inside[pos] == '/') {
+            ++pos;
+            skipSpaces();
+            if (pos != inside.size()) throw runtime_error("Invalid self-closing tag");
+            return true;
+        }
+        size_t start = pos;
+        while (pos < inside.size() &&
+               !isspace(static_cast<unsigned char>(inside[pos])) &&
+               inside[pos] != '=' && inside[pos] != '/') ++pos;
+        if (start == pos) throw runtime_error("Missing attribute name");
+        string name = lowerAscii(inside.substr(start, pos - start));
+        string value;
+        skipSpaces();
+        if (pos < inside.size() && inside[pos] == '=') {
+            ++pos;
+            skipSpaces();
+            if (pos == inside.size()) throw runtime_error("Missing attribute value");
+            if (inside[pos] == '\'' || inside[pos] == '"') {
+                char quote = inside[pos++];
+                start = pos;
+                while (pos < inside.size() && inside[pos] != quote) ++pos;
+                if (pos == inside.size()) throw runtime_error("Unclosed attribute value");
+                value = inside.substr(start, pos - start);
+                ++pos;
+            } else {
+                start = pos;
+                while (pos < inside.size() &&
+                       !isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
+                value = inside.substr(start, pos - start);
+            }
+        }
+        // 无等号的属性（如 disabled）存为空串；重复属性保留第一次出现的值。
+        attributes.emplace(name, value);
+    }
+}
+
+unique_ptr<Node> parseHtml(const string& html) {
+    const set<string> voidTags = {"area", "base", "br", "col", "embed",
+        "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
+    auto root = make_unique<Node>("#document");
+    stack<Node*> path;
+    path.push(root.get());
+    const string lowerHtml = lowerAscii(html);
+    size_t i = 0;
+
+    while (i < html.size()) {
+        // 1. 普通文字：一直读取到下一个 <。
+        if (html[i] != '<') {
+            size_t end = html.find('<', i);
+            if (end == string::npos) end = html.size();
+            auto node = make_unique<Node>("#text");
+            node->text = html.substr(i, end - i);
+            path.top()->children.push_back(move(node));
+            i = end;
+            continue;
+        }
+
+        // 2. 注释不进入树。
+        if (html.compare(i, 4, "<!--") == 0) {
+            size_t end = html.find("-->", i + 4);
+            if (end == string::npos) throw runtime_error("Unclosed comment");
+            i = end + 3;
+            continue;
+        }
+
+        size_t end = tagEnd(html, i);
+        string inside = html.substr(i + 1, end - i - 1);
+        i = end + 1;
+        if (inside.empty()) throw runtime_error("Empty tag");
+        if (inside[0] == '!') continue;  // 例如 <!DOCTYPE html>
+
+        bool closing = inside[0] == '/';
+        size_t start = closing ? 1 : 0;
+        size_t pos = start;
+        while (pos < inside.size() &&
+               !isspace(static_cast<unsigned char>(inside[pos])) && inside[pos] != '/')
+            ++pos;
+        string tag = lowerAscii(inside.substr(start, pos - start));
+        if (tag.empty()) throw runtime_error("Missing tag name");
+
+        // 3. 结束标签：回到父节点。
+        if (closing) {
+            if (path.size() == 1 || path.top()->tag != tag)
+                throw runtime_error("Mismatched closing tag: " + tag);
+            path.pop();
+            continue;
+        }
+
+        // 4. 开始标签：先作为当前节点的孩子。
+        auto node = make_unique<Node>(tag);
+        bool selfClosing = parseAttributes(inside, pos, node->attributes);
+        Node* child = node.get();
+        path.top()->children.push_back(move(node));
+
+        // 教学简化：script/style 的内容直接跳过，不将其中的 < 当成标签。
+        if (tag == "script" || tag == "style") {
+            string marker = "</" + tag;
+            size_t close = i;
+            while (true) {
+                close = lowerHtml.find(marker, close);
+                if (close == string::npos) throw runtime_error("Unclosed " + tag);
+                size_t after = close + marker.size();
+                if (after < html.size() && (html[after] == '>' ||
+                    isspace(static_cast<unsigned char>(html[after])))) break;
+                ++close;
+            }
+            i = tagEnd(html, close) + 1;
+            continue;
+        }
+
+        if (!selfClosing && !voidTags.count(tag)) path.push(child);
+    }
+    if (path.size() != 1) throw runtime_error("Unclosed tag: " + path.top()->tag);
+    return root;
+}
+
+void collectText(const Node& node, string& result) {
+    if (node.tag == "head" || node.tag == "script" || node.tag == "style") return;
+    if (node.tag == "#text") {
+        result += node.text;
+        return;
+    }
+    if (node.tag == "br") result += '\n';
+    for (const auto& child : node.children) collectText(*child, result);
+    // 少量常见块标签的简化换行规则。
+    const set<string> blocks = {"p", "div", "h1", "h2", "h3", "li"};
+    if (blocks.count(node.tag) && !result.empty() && result.back() != '\n')
+        result += '\n';
+}
+
+// 仅用于显示：把换行、制表符等转义，保证一段文字只占一条输出记录。
+string displayText(const string& text) {
+    string result;
+    for (char c : text) {
+        if (c == '\n') result += "\\n";
+        else if (c == '\r') result += "\\r";
+        else if (c == '\t') result += "\\t";
+        else if (c == '\\') result += "\\\\";
+        else result += c;
+    }
+    return result;
+}
+
+// 每个文本节点输出一条记录；坐标逐层继承，当前节点的同名属性优先。
+// rowindex/colindex 按值传递，防止一个兄弟节点的坐标影响另一个。
+void printTextWithPosition(const Node& node,
+                           string rowindex = "N/A", string colindex = "N/A") {
+    if (node.tag == "head" || node.tag == "script" || node.tag == "style") return;
+
+    auto row = node.attributes.find("rowindex");
+    if (row != node.attributes.end()) rowindex = row->second;
+    auto col = node.attributes.find("colindex");
+    if (col != node.attributes.end()) colindex = col->second;
+
+    if (node.tag == "#text") {
+        if (node.text.find_first_not_of(" \t\r\n\f\v") != string::npos) {
+            cout << "rowindex=" << displayText(rowindex)
+                 << " colindex=" << displayText(colindex)
+                 << " text=" << displayText(node.text) << '\n';
+        }
+        return;
+    }
+    for (const auto& child : node.children)
+        printTextWithPosition(*child, rowindex, colindex);
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        ifstream file(argc > 1 ? argv[1] : "test.html", ios::binary);
+        if (!file) throw runtime_error("Cannot open HTML file");
+        ostringstream buffer;
+        buffer << file.rdbuf();
+        auto root = parseHtml(buffer.str());
+        printTextWithPosition(*root);
+        return 0;
+    } catch (const exception& e) {
+        cerr << "Error: " << e.what() << '\n';
+        return 1;
+    }
+}
