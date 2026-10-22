@@ -37,7 +37,7 @@
 #include <string>     // 字符串与查找、截取操作
 #include <utility>    // move：转移 unique_ptr 的所有权
 #include <vector>     // 按顺序保存一个节点的所有孩子
-// 省略 std:: 前缀，适合本教学示例；大型项目通常按需使用 std::。
+ // 省略 std:: 前缀，适合本教学示例；大型项目通常按需使用 std::。
 using namespace std;
 
 struct Node {
@@ -70,10 +70,12 @@ size_t tagEnd(const string& html, size_t start) {
         if (quote) {
             // 引号内部的 > 不结束标签；只有同种引号才能结束属性值。
             if (c == quote) quote = 0;
-        } else if (c == '\'' || c == '"') {
+        }
+        else if (c == '\'' || c == '"') {
             // 开始读取引号包住的内容。'\'' 表示单引号字符。
             quote = c;
-        } else if (c == '>') {
+        }
+        else if (c == '>') {
             // 只有引号外的 > 才是标签结尾，返回它在 html 中的位置。
             return j;
         }
@@ -83,15 +85,15 @@ size_t tagEnd(const string& html, size_t start) {
 
 // pos 从标签名后面开始；保存属性，并返回是否有独立的自闭合 /。
 bool parseAttributes(const string& inside, size_t pos,
-                     map<string, string>& attributes) {
+    map<string, string>& attributes) {
     // inside 不包含 < 和 >，如：div rowindex="1" colindex="2"。
     // attributes 按引用传入，所以 emplace 会直接修改标签节点的属性表。
     // 这是一个局部 lambda（小函数）；[&] 让它访问并修改外面的 pos。
     auto skipSpaces = [&]() {
         // isspace 接收 unsigned char 可表示的值，避免负 char 引起未定义行为。
         while (pos < inside.size() &&
-               isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
-    };
+            isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
+        };
     while (true) {
         skipSpaces();
         // 属性全部读完，没有遇到独立的 /，返回 false。
@@ -107,8 +109,8 @@ bool parseAttributes(const string& inside, size_t pos,
         size_t start = pos;
         // 属性名读到空白、等号或独立斜杠为止。
         while (pos < inside.size() &&
-               !isspace(static_cast<unsigned char>(inside[pos])) &&
-               inside[pos] != '=' && inside[pos] != '/') ++pos;
+            !isspace(static_cast<unsigned char>(inside[pos])) &&
+            inside[pos] != '=' && inside[pos] != '/') ++pos;
         if (start == pos) throw runtime_error("Missing attribute name");
         string name = lowerAscii(inside.substr(start, pos - start));
         string value; // 默认空串，用于 disabled 这类没有 = 的布尔属性
@@ -124,11 +126,12 @@ bool parseAttributes(const string& inside, size_t pos,
                 if (pos == inside.size()) throw runtime_error("Unclosed attribute value");
                 value = inside.substr(start, pos - start);
                 ++pos; // 越过闭合引号
-            } else {
+            }
+            else {
                 // 无引号的属性值一直读取到空白或字符串末尾。
                 start = pos;
                 while (pos < inside.size() &&
-                       !isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
+                    !isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
                 value = inside.substr(start, pos - start);
             }
         }
@@ -139,8 +142,8 @@ bool parseAttributes(const string& inside, size_t pos,
 
 unique_ptr<Node> parseHtml(const string& html) {
     // voidTags 是 HTML 无结束标签集合；这些节点不能接收子节点。
-    const set<string> voidTags = {"area", "base", "br", "col", "embed",
-        "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
+    const set<string> voidTags = { "area", "base", "br", "col", "embed",
+        "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr" };
     // 虚拟根把多个顶层节点放在同一棵树中，本身不来自 HTML 标签。
     auto root = make_unique<Node>("#document");
     // 树中 unique_ptr 拥有节点；栈中 Node* 只记录位置，不负责释放内存。
@@ -187,7 +190,7 @@ unique_ptr<Node> parseHtml(const string& html) {
         size_t pos = start;
         // 先读标签名；pos 最后停在标签名后面，正好交给属性解析函数。
         while (pos < inside.size() &&
-               !isspace(static_cast<unsigned char>(inside[pos])) && inside[pos] != '/')
+            !isspace(static_cast<unsigned char>(inside[pos])) && inside[pos] != '/')
             ++pos;
         string tag = lowerAscii(inside.substr(start, pos - start));
         if (tag.empty()) throw runtime_error("Missing tag name");
@@ -267,45 +270,59 @@ string displayText(const string& text) {
 
 // 寻找列节点：每列一行，每段文字各输出一个 text=，空列也保留。
 // rowindex 按值传递，因此一个分支修改行号不会影响其他兄弟分支。
-void printCells(const Node& node, string rowindex = "N/A") {
-    if (node.tag == "head" || node.tag == "script" || node.tag == "style") return;
+void printCells(
+    const Node& node,
+    ostream& out,
+    string rowindex = "N/A",
+    bool inRowgroup = false
+    
+) {
+    if (node.tag == "head" ||
+        node.tag == "script" ||
+        node.tag == "style") {
+        return;
+    }
 
-
-        // 当前节点带有 rowgroup 属性，就进入允许输出的范围
+    // 当前节点带有 rowgroup 属性，就进入允许输出的范围
     if (node.attributes.count("rowgroup") > 0) {
         inRowgroup = true;
     }
-    // find 返回迭代器；等于 end() 表示未找到，找到后 second 是属性值。
-    auto row = node.attributes.find("rowindex");
-    if (row != node.attributes.end()) rowindex = row->second;
 
-    // 只要当前标签自己带 colindex，就把它作为一个单元格处理。
+    // 更新行号
+    auto row = node.attributes.find("rowindex");
+
+    if (row != node.attributes.end()) {
+        rowindex = row->second;
+    }
+
+    // 查找列号
     auto col = node.attributes.find("colindex");
-    if (inRowgroup &&col != node.attributes.end()) {
-        // 每列使用独立的列表，避免上一列的文本残留到下一列。
+
+    // 必须同时满足：处在 rowgroup 内，并且当前节点带 colindex
+    if (inRowgroup && col != node.attributes.end()) {
         vector<string> texts;
         collectCellTexts(node, texts);
 
-        // 先输出该列的行号和列号，不在这里换行。
-        cout << "rowindex=" << displayText(rowindex)
-             << " colindex=" << displayText(col->second);
+        out << "rowindex=" << displayText(rowindex)
+            << " colindex=" << displayText(col->second);
 
         if (texts.empty()) {
-            // 空列或只有空白的列，仍然输出一个空 text=。
-            cout << " text=";
-        } else {
-            // 多个文本节点在同一行输出，每段文字前重复 text=。
-            for (const string& text : texts)
-                cout << " text=" << displayText(text);
+            out << " text=";
         }
-        cout << '\n'; // 整列输出完毕后，才换到下一行
-        return; // 该列已整体输出，不再逐个输出它内部的孩子
+        else {
+            for (const string& text : texts) {
+                out << " text=" << displayText(text);
+            }
+        }
+
+        out << '\n';
+        return;
     }
 
-    // 还没找到列节点就继续向下搜索。
-    // *child 解引用智能指针，取得实际节点，传给引用参数。
-    for (const auto& child : node.children)
-        printCells(*child, rowindex,inRowgroup);
+    // 即使目前不在 rowgroup 内，也要继续寻找后代中的 rowgroup
+    for (const auto& child : node.children) {
+        printCells(*child, out,rowindex, inRowgroup);
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -316,14 +333,16 @@ int main(int argc, char* argv[]) {
         ifstream file(argc > 1 ? argv[1] : "test.html", ios::binary);
         // 打开失败时抛出异常，跳到下面的 catch，而不是继续解析空内容。
         if (!file) throw runtime_error("Cannot open HTML file");
+        ofstream out("output.txt");
         ostringstream buffer;
         buffer << file.rdbuf(); // 把文件中剩余的全部内容读入字符串流
         // str() 取出字符串；root 拥有完整树，离开 main 时自动释放全部节点。
         auto root = parseHtml(buffer.str());
-        printCells(*root);
+        printCells(*root,out);
         // 若没有任何带 colindex 的节点，本版不会输出记录。
         return 0; // 返回 0 表示成功结束
-    } catch (const exception& e) {
+    }
+    catch (const exception& e) {
         // what() 提供错误说明；cerr 用于错误输出。
         cerr << "Error: " << e.what() << '\n';
         return 1; // 非 0 返回值表示执行失败
