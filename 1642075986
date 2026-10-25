@@ -1,311 +1,1120 @@
-/*
- * C++17 HTML 文本解析器（中文注释教学版）
- *
- * 执行顺序：
- *   main 读取文件 -> parseHtml 建立多叉树 -> printCells 寻找列节点
- *   -> appendCellText 合并列内文字 -> 输出 rowindex、colindex、text。
- *
- * 输入示例（保存为 test.html）：
- *   <div rowindex="1"><div colindex="2"></div>
- *   <div colindex="3">A<span>B</span>C</div></div>
- * 输出：
- *   rowindex=1 colindex=2 text=
- *   rowindex=1 colindex=3 text=ABC
- *
- * 本版约定：行节点包含列节点；列节点内部可嵌套普通标签，
- * 但不再嵌套其他带 rowindex/colindex 的行列节点。
- * 没有文字的列也输出；列外的文字不输出；缺少行号时显示 N/A。
- * 保留列内原有空白，不自动在相邻文本之间加分隔符。
- *
- * 这是静态 HTML 的教学解析器，不执行 JavaScript，不处理 CSS 可见性，
- * 不解码 &amp; 等实体，也不实现浏览器自动补全标签等完整规则。
- * 普通标签必须正确嵌套并显式关闭；支持常见无结束标签和自闭合写法。
- *
- * 编译：g++ -std=c++17 html_innertext.cpp -o html_innertext
- * 运行：./html_innertext test.html（VS 中可以直接运行，默认读取 test.html）
- */
-#include <cctype>     // isspace：判断空格、换行等空白字符
-#include <fstream>    // ifstream：从文件读取内容
-#include <iostream>   // cout 输出正常结果，cerr 输出错误
-#include <map>        // 属性表：根据属性名查找属性值
-#include <memory>     // unique_ptr、make_unique：自动管理节点内存
-#include <set>        // 保存无结束标签的名字，方便判断成员关系
-#include <sstream>    // ostringstream：把文件内容收集为字符串
-#include <stack>      // 记录当前进入了哪些标签
-#include <stdexcept>  // runtime_error：报告解析或文件错误
-#include <string>     // 字符串与查找、截取操作
-#include <utility>    // move：转移 unique_ptr 的所有权
-#include <vector>     // 按顺序保存一个节点的所有孩子
-// 省略 std:: 前缀，适合本教学示例；大型项目通常按需使用 std::。
-using namespace std;
+可以。你现在最需要掌握的是：**节点怎样创建、怎样连接成树、怎样访问和遍历，以及指针的所有权如何变化。** 这些弄清楚后，`parseHTML()` 就容易理解了。
 
+下面统一采用你当前程序中的方式：**`unique_ptr` 管理节点，普通指针负责访问节点。**
+
+---
+
+**1．先理解多叉树节点的定义**
+
+```cpp
 struct Node {
-    string tag;  // 标签名；文本节点用 #text，虚拟根节点用 #document
-    string text; // 仅文本节点保存原始文字，标签节点通常保持空串
-    map<string, string> attributes;  // 属性名 -> 属性值，仅标签节点使用
-    vector<unique_ptr<Node>> children;  // 一个节点可以有任意多个孩子
-    // 构造函数：创建节点时立即设置 tag，其他成员默认初始化为空。
-    // explicit 防止其他类型的值被隐式转换成 Node。
-    explicit Node(string name) : tag(name) {}
+    string tag;                           // 标签名
+    string text;                          // 文本内容
+    map<string, string> attrs;             // 属性
+    vector<unique_ptr<Node>> children;     // 子节点列表
 };
+```
 
-// 按值接收字符串副本，只转换 ASCII 英文大写字母，不改写原参数。
-// 用于统一标签名、属性名的大小写；属性值和正文不转小写。
-string lowerAscii(string s) {
-    // char& 是引用，修改 c 就是在修改 s 中当前的字符。
-    for (char& c : s)
-        if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
-    return s;
+一个节点可以有任意数量的子节点，因此称为“多叉树”。
+
+例如：
+
+```html
+<div>
+    <span>你好</span>
+    <p>世界</p>
+</div>
+```
+
+对应的节点关系是：
+
+- `div` 有两个子节点：`span` 和 `p`。
+- `span` 有一个文本子节点：“你好”。
+- `p` 有一个文本子节点：“世界”。
+
+其中，**父节点通过 `children` 中的 `unique_ptr` 管理孩子的生命周期。**
+
+---
+
+**2．区分对象、智能指针、普通指针、引用**
+
+这是理解后面所有操作的基础。
+
+```cpp
+Node a;                          // 一个节点对象
+
+auto b = make_unique<Node>();     // 管理一个节点的智能指针
+
+Node* c = b.get();                // 指向该节点的普通指针
+
+Node& d = *b;                     // 该节点的引用
+```
+
+访问成员的方式：
+
+```cpp
+a.tag = "div";   // 对象用 .
+b->tag = "div";  // 指针用 ->
+c->tag = "div";  // 指针用 ->
+d.tag = "div";   // 引用用 .
+```
+
+这里 `b`、`c`、`d` 访问的是同一个节点：
+
+```cpp
+b->tag = "span";
+
+cout << c->tag;  // span
+cout << d.tag;   // span
+```
+
+但它们的职责不同：
+
+| 类型 | 能访问节点 | 负责自动释放节点 |
+|---|---|---|
+| `unique_ptr<Node>` | 能 | 是 |
+| `Node*` | 能 | 否 |
+| `Node&` | 能 | 否 |
+
+**普通指针和引用并不会让节点“多活一会儿”。节点被删除后，它们就不能再使用。**
+
+---
+
+**3．创建节点**
+
+创建一个元素节点：
+
+```cpp
+auto n = make_unique<Node>();
+
+n->tag = "div";
+n->attrs["role"] = "rowgroup";
+```
+
+创建一个文本节点：
+
+```cpp
+auto n = make_unique<Node>();
+
+n->tag = "#text";
+n->text = "你好";
+```
+
+可以把常用的创建操作写成函数：
+
+```cpp
+unique_ptr<Node> makeElement(const string& tag) {
+    auto n = make_unique<Node>();
+    n->tag = tag;
+    return n;
 }
 
-// 在引号外寻找 >，避免把 title="a > b" 中的 > 当作标签结尾。
-size_t tagEnd(const string& html, size_t start) {
-    // const string&：只读访问原字符串，不复制完整 HTML。
-    // size_t 是长度/索引类型。start 指向标签开头的 <。
-    // quote 为 0 表示不在引号里，否则记录当前是单引号还是双引号。
-    char quote = 0;
-    for (size_t j = start + 1; j < html.size(); ++j) {
-        char c = html[j];
-        if (quote) {
-            // 引号内部的 > 不结束标签；只有同种引号才能结束属性值。
-            if (c == quote) quote = 0;
-        } else if (c == '\'' || c == '"') {
-            // 开始读取引号包住的内容。'\'' 表示单引号字符。
-            quote = c;
-        } else if (c == '>') {
-            // 只有引号外的 > 才是标签结尾，返回它在 html 中的位置。
-            return j;
-        }
+unique_ptr<Node> makeText(const string& text) {
+    auto n = make_unique<Node>();
+    n->tag = "#text";
+    n->text = text;
+    return n;
+}
+```
+
+调用：
+
+```cpp
+auto div = makeElement("div");
+auto text = makeText("你好");
+```
+
+这里返回的是**新节点的所有权**。
+
+---
+
+**4．创建整棵树的根节点**
+
+```cpp
+auto root = make_unique<Node>();
+root->tag = "#document";
+```
+
+`#document` 是程序约定的名字，表示整份文档。
+
+创建完后，树里暂时只有一个根节点：
+
+```cpp
+root->children.size() == 0
+```
+
+根节点同样只是一个 `Node`，它之所以是根，是因为它没有被放进其他节点的 `children`。
+
+---
+
+**5．把节点添加到父节点下面**
+
+```cpp
+auto root = makeElement("#document");
+auto div = makeElement("div");
+
+root->children.push_back(move(div));
+```
+
+意思是：
+
+> 把 `div` 放进根节点的孩子列表，由根节点接管它。
+
+执行后：
+
+```cpp
+div == nullptr;              // true
+root->children.size() == 1;  // true
+```
+
+节点还存在，只是所有权从变量 `div` 转移到了：
+
+```cpp
+root->children[0]
+```
+
+所以后续应该这样访问：
+
+```cpp
+cout << root->children[0]->tag;  // div
+```
+
+不能再这样访问：
+
+```cpp
+cout << div->tag;  // 错误：div 已为空
+```
+
+---
+
+**6．添加后还想继续访问新节点**
+
+可以在移动前保存普通指针：
+
+```cpp
+auto div = makeElement("div");
+
+Node* ptr = div.get();
+
+root->children.push_back(move(div));
+
+// div 已为空，但 ptr 仍指向树里的节点
+ptr->attrs["role"] = "rowgroup";
+```
+
+这里：
+
+```cpp
+Node* ptr = div.get();
+```
+
+只获取地址，没有转移所有权。
+
+也可以添加后，从父节点中获取：
+
+```cpp
+root->children.push_back(makeElement("div"));
+
+Node* ptr = root->children.back().get();
+```
+
+为了方便，可以封装为：
+
+```cpp
+Node* appendChild(Node& parent, unique_ptr<Node> child) {
+    if (!child) {
+        return nullptr;
     }
-    throw runtime_error("Unclosed tag"); // 找不到结尾，交给 main 的 catch 报错
+
+    Node* ptr = child.get();
+
+    parent.children.push_back(move(child));
+
+    return ptr;
 }
+```
 
-// pos 从标签名后面开始；保存属性，并返回是否有独立的自闭合 /。
-bool parseAttributes(const string& inside, size_t pos,
-                     map<string, string>& attributes) {
-    // inside 不包含 < 和 >，如：div rowindex="1" colindex="2"。
-    // attributes 按引用传入，所以 emplace 会直接修改标签节点的属性表。
-    // 这是一个局部 lambda（小函数）；[&] 让它访问并修改外面的 pos。
-    auto skipSpaces = [&]() {
-        // isspace 接收 unsigned char 可表示的值，避免负 char 引起未定义行为。
-        while (pos < inside.size() &&
-               isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
-    };
-    while (true) {
-        skipSpaces();
-        // 属性全部读完，没有遇到独立的 /，返回 false。
-        if (pos == inside.size()) return false;
-        if (inside[pos] == '/') {
-            // 处理 <br />、<div colindex="2"/> 末尾的独立斜杠。
-            // 无引号属性值中的 / 算属性值的一部分；例：colindex=2/。
-            ++pos;
-            skipSpaces();
-            if (pos != inside.size()) throw runtime_error("Invalid self-closing tag");
-            return true;
-        }
-        size_t start = pos;
-        // 属性名读到空白、等号或独立斜杠为止。
-        while (pos < inside.size() &&
-               !isspace(static_cast<unsigned char>(inside[pos])) &&
-               inside[pos] != '=' && inside[pos] != '/') ++pos;
-        if (start == pos) throw runtime_error("Missing attribute name");
-        string name = lowerAscii(inside.substr(start, pos - start));
-        string value; // 默认空串，用于 disabled 这类没有 = 的布尔属性
-        skipSpaces();
-        if (pos < inside.size() && inside[pos] == '=') {
-            ++pos; // 越过等号，再跳过等号后可能出现的空白
-            skipSpaces();
-            if (pos == inside.size()) throw runtime_error("Missing attribute value");
-            if (inside[pos] == '\'' || inside[pos] == '"') {
-                char quote = inside[pos++]; // 记录引号，同时把 pos 移到属性值首字符
-                start = pos;
-                while (pos < inside.size() && inside[pos] != quote) ++pos;
-                if (pos == inside.size()) throw runtime_error("Unclosed attribute value");
-                value = inside.substr(start, pos - start);
-                ++pos; // 越过闭合引号
-            } else {
-                // 无引号的属性值一直读取到空白或字符串末尾。
-                start = pos;
-                while (pos < inside.size() &&
-                       !isspace(static_cast<unsigned char>(inside[pos]))) ++pos;
-                value = inside.substr(start, pos - start);
-            }
-        }
-        // 无等号的属性（如 disabled）存为空串；重复属性保留第一次出现的值。
-        attributes.emplace(name, value);
-    }
+使用：
+
+```cpp
+Node* div = appendChild(*root, makeElement("div"));
+
+Node* span = appendChild(*div, makeElement("span"));
+
+appendChild(*span, makeText("你好"));
+```
+
+这样就建立了：
+
+> root 的孩子是 div，div 的孩子是 span，span 的孩子是文本“你好”。
+
+注意这个函数的两个参数：
+
+```cpp
+Node& parent
+```
+
+表示访问已有的父节点。
+
+```cpp
+unique_ptr<Node> child
+```
+
+表示接收孩子的所有权。
+
+---
+
+**7．访问某个子节点**
+
+访问第一个子节点：
+
+```cpp
+if (!root->children.empty()) {
+    Node* first = root->children.front().get();
+
+    cout << first->tag;
 }
+```
 
-unique_ptr<Node> parseHtml(const string& html) {
-    // voidTags 是 HTML 无结束标签集合；这些节点不能接收子节点。
-    const set<string> voidTags = {"area", "base", "br", "col", "embed",
-        "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
-    // 虚拟根把多个顶层节点放在同一棵树中，本身不来自 HTML 标签。
-    auto root = make_unique<Node>("#document");
-    // 树中 unique_ptr 拥有节点；栈中 Node* 只记录位置，不负责释放内存。
-    stack<Node*> path;
-    // get() 取得地址，不转移所有权。栈顶始终表示当前接收孩子的节点。
-    path.push(root.get());
-    // 小写副本仅用于寻找 script/style 的结束位置，正文仍取原始 html。
-    const string lowerHtml = lowerAscii(html);
-    size_t i = 0; // 当前扫描位置；各个分支处理完成后都必须推进它
+访问最后一个子节点：
 
-    while (i < html.size()) {
-        // 1. 普通文字：一直读取到下一个 <。
-        if (html[i] != '<') {
-            size_t end = html.find('<', i);
-            // find 找不到目标时返回 string::npos，表示文字一直延续到文件末尾。
-            if (end == string::npos) end = html.size();
-            auto node = make_unique<Node>("#text");
-            node->text = html.substr(i, end - i); // substr(起点, 字符数)
-            // -> 通过指针访问成员。move 把节点交给孩子列表，节点地址不变。
-            path.top()->children.push_back(move(node));
-            i = end;
-            continue; // 文字处理完毕，进入下一轮，不执行本轮后面的标签代码
-        }
+```cpp
+if (!root->children.empty()) {
+    Node* last = root->children.back().get();
 
-        // 2. 注释不进入树。
-        if (html.compare(i, 4, "<!--") == 0) {
-            // compare 返回 0 表示当前位置的四个字符等于 <!--。
-            size_t end = html.find("-->", i + 4);
-            if (end == string::npos) throw runtime_error("Unclosed comment");
-            i = end + 3; // --> 占三个字符，移动到它后面
-            continue;
-        }
-
-        size_t end = tagEnd(html, i);
-        // 取出尖括号之间的内容，比如 p class="intro" 或 /p。
-        string inside = html.substr(i + 1, end - i - 1);
-        i = end + 1; // 下次从 > 后面开始扫描
-        if (inside.empty()) throw runtime_error("Empty tag");
-        if (inside[0] == '!') continue;  // 例如 <!DOCTYPE html>
-
-        bool closing = inside[0] == '/';
-        // 三目运算符：结束标签跳过开头的 /，开始标签从索引 0 读取。
-        size_t start = closing ? 1 : 0;
-        size_t pos = start;
-        // 先读标签名；pos 最后停在标签名后面，正好交给属性解析函数。
-        while (pos < inside.size() &&
-               !isspace(static_cast<unsigned char>(inside[pos])) && inside[pos] != '/')
-            ++pos;
-        string tag = lowerAscii(inside.substr(start, pos - start));
-        if (tag.empty()) throw runtime_error("Missing tag name");
-
-        // 3. 结束标签：回到父节点。
-        if (closing) {
-            // 只剩虚拟根时不能再关闭；标签名也必须与当前栈顶匹配。
-            if (path.size() == 1 || path.top()->tag != tag)
-                throw runtime_error("Mismatched closing tag: " + tag);
-            path.pop(); // 离开当前标签；仅移除栈中地址，不删除树中的节点
-            continue;
-        }
-
-        // 4. 开始标签：先作为当前节点的孩子。
-        auto node = make_unique<Node>(tag);
-        // 所有属性都保存在节点上，输出时再选择 rowindex/colindex。
-        bool selfClosing = parseAttributes(inside, pos, node->attributes);
-        // move 后 node 不再拥有节点，所以事先用 child 记住地址。
-        Node* child = node.get();
-        path.top()->children.push_back(move(node));
-
-        // 教学简化：script/style 的内容直接跳过，不将其中的 < 当成标签。
-        if (tag == "script" || tag == "style") {
-            // 即使 type="text/html"，本版也跳过 script 中的模板内容。
-            string marker = "</" + tag;
-            size_t close = i;
-            while (true) {
-                close = lowerHtml.find(marker, close);
-                if (close == string::npos) throw runtime_error("Unclosed " + tag);
-                size_t after = close + marker.size();
-                // 检查标签名后的边界，避免把 </scriptx> 认成 </script>。
-                if (after < html.size() && (html[after] == '>' ||
-                    isspace(static_cast<unsigned char>(html[after])))) break;
-                ++close;
-            }
-            i = tagEnd(html, close) + 1; // 直接跳到整个结束标签之后
-            continue;
-        }
-
-        // count 在 set 中返回 0 或 1；普通开始标签才入栈，接收后续孩子。
-        if (!selfClosing && !voidTags.count(tag)) path.push(child);
-    }
-    // 扫描结束时应当只剩虚拟根；否则还有标签忘记关闭。
-    if (path.size() != 1) throw runtime_error("Unclosed tag: " + path.top()->tag);
-    return root; // 将整棵树的所有权交给调用者，局部 root 可以直接返回
+    cout << last->tag;
 }
+```
 
-// 收集一个列节点下面的全部文本。const Node& 不复制/修改节点；
-// string& 让所有递归调用追加到同一个结果字符串中。
-void appendCellText(const Node& node, string& text) {
-    if (node.tag == "head" || node.tag == "script" || node.tag == "style") return;
+访问第 `i` 个子节点：
+
+```cpp
+size_t i = 1;
+
+if (i < root->children.size()) {
+    Node* child = root->children[i].get();
+}
+```
+
+两种下标访问的区别：
+
+```cpp
+root->children[i];     // 不检查越界
+root->children.at(i);  // 越界时抛出异常
+```
+
+**`front()`、`back()` 和 `[]` 都需要你保证访问位置有效。**
+
+---
+
+**8．遍历一个节点的所有直接孩子**
+
+```cpp
+for (const auto& child : root->children) {
+    cout << child->tag << '\n';
+}
+```
+
+注意这里写：
+
+```cpp
+const auto& child
+```
+
+而不是：
+
+```cpp
+auto child  // 错误：会尝试复制 unique_ptr
+```
+
+因为 `unique_ptr` 不能复制。
+
+如果要修改孩子：
+
+```cpp
+for (auto& child : root->children) {
+    child->attrs["visited"] = "true";
+}
+```
+
+这两种循环都只处理**直接孩子**，不会自动访问孙节点。
+
+另外，一个容易混淆的细节是：
+
+```cpp
+const auto& child
+```
+
+限制的是智能指针本身，**不代表它指向的节点一定只读**。如果要明确只读，可以使用：
+
+```cpp
+const Node* ptr = child.get();
+```
+
+或者让函数接收 `const Node&`。
+
+---
+
+**9．遍历整棵树：递归深度优先搜索**
+
+访问当前节点，再访问所有子树：
+
+```cpp
+void printTree(const Node& node, int depth = 0) {
+    cout << string(depth * 2, ' ') << node.tag;
+
     if (node.tag == "#text") {
-        text += node.text; // 空串不会增加内容；保留原始空格、换行
+        cout << ": " << node.text;
+    }
+
+    cout << '\n';
+
+    for (const auto& child : node.children) {
+        printTree(*child, depth + 1);
+    }
+}
+```
+
+调用：
+
+```cpp
+printTree(*root);
+```
+
+其中：
+
+```cpp
+*root
+```
+
+表示取得智能指针指向的节点对象。
+
+```cpp
+*child
+```
+
+同样表示取得子节点对象。
+
+这种遍历叫**前序遍历**，顺序是：
+
+> 当前节点 → 第一个孩子及其后代 → 第二个孩子及其后代……
+
+它很适合打印结构、查找节点和按文档顺序提取文本。
+
+---
+
+**10．后序遍历：先处理孩子，再处理自己**
+
+```cpp
+void postorder(const Node& node) {
+    for (const auto& child : node.children) {
+        postorder(*child);
+    }
+
+    cout << node.tag << '\n';
+}
+```
+
+这种方式适合“当前节点的结果依赖所有孩子”的计算。
+
+例如统计整棵子树有多少个节点：
+
+```cpp
+size_t countNodes(const Node& node) {
+    size_t total = 1;  // 当前节点也算一个
+
+    for (const auto& child : node.children) {
+        total += countNodes(*child);
+    }
+
+    return total;
+}
+```
+
+调用：
+
+```cpp
+cout << countNodes(*root);
+```
+
+---
+
+**11．不用递归，自己用栈遍历**
+
+这和你解析 HTML 时使用栈的思路有关：
+
+```cpp
+void walkDFS(const Node& root) {
+    vector<const Node*> pending{ &root };
+
+    while (!pending.empty()) {
+        const Node* current = pending.back();
+        pending.pop_back();
+
+        cout << current->tag << '\n';
+
+        // 倒着入栈，才能按原来的孩子顺序访问
+        for (auto it = current->children.rbegin();
+             it != current->children.rend();
+             ++it) {
+            pending.push_back(it->get());
+        }
+    }
+}
+```
+
+为什么孩子要倒着入栈？
+
+因为栈是**后进先出**。想先访问第一个孩子，就要最后把它放进去。
+
+对于层数很深的树，显式使用栈可以避免递归遍历占用过深的函数调用栈。
+
+---
+
+**12．按层遍历：广度优先搜索**
+
+需要：
+
+```cpp
+#include <queue>
+```
+
+实现：
+
+```cpp
+void walkBFS(const Node& root) {
+    queue<const Node*> pending;
+    pending.push(&root);
+
+    while (!pending.empty()) {
+        const Node* current = pending.front();
+        pending.pop();
+
+        cout << current->tag << '\n';
+
+        for (const auto& child : current->children) {
+            pending.push(child.get());
+        }
+    }
+}
+```
+
+访问顺序是：
+
+> 根节点 → 所有第一层孩子 → 所有第二层孩子……
+
+| 方法 | 使用的辅助结构 | 特点 |
+|---|---|---|
+| DFS | 栈或递归 | 先沿一条分支深入 |
+| BFS | 队列 | 一层一层访问 |
+
+---
+
+**13．查找第一个符合条件的节点**
+
+例如查找第一个 `role="rowgroup"`：
+
+```cpp
+Node* findRowGroup(Node& node) {
+    auto it = node.attrs.find("role");
+
+    if (it != node.attrs.end() &&
+        it->second == "rowgroup") {
+        return &node;
+    }
+
+    for (auto& child : node.children) {
+        Node* result = findRowGroup(*child);
+
+        if (result != nullptr) {
+            return result;
+        }
+    }
+
+    return nullptr;
+}
+```
+
+调用：
+
+```cpp
+Node* group = findRowGroup(*root);
+
+if (group != nullptr) {
+    cout << group->tag;
+}
+```
+
+这里返回的：
+
+```cpp
+Node*
+```
+
+表示**找到的已有节点的地址**，没有把节点从树里取出来，也没有转移所有权。
+
+查找失败则返回：
+
+```cpp
+nullptr
+```
+
+如果只需要读取，可以将参数和返回值改为：
+
+```cpp
+const Node* findRowGroup(const Node& node);
+```
+
+---
+
+**14．查找所有符合条件的节点**
+
+例如查找所有具有 `aria-colindex` 属性的节点：
+
+```cpp
+void findAllCols(Node& node, vector<Node*>& results) {
+    if (node.attrs.find("aria-colindex") != node.attrs.end()) {
+        results.push_back(&node);
+    }
+
+    for (auto& child : node.children) {
+        findAllCols(*child, results);
+    }
+}
+```
+
+调用：
+
+```cpp
+vector<Node*> cols;
+
+findAllCols(*root, cols);
+
+for (Node* col : cols) {
+    cout << col->attrs.at("aria-colindex") << '\n';
+}
+```
+
+`cols` 只是保存查找结果的地址，节点仍归原来的树所有。
+
+**如果随后删除了树中的节点，`cols` 中相应的指针也就失效了。**
+
+---
+
+**15．读取、修改和删除节点属性**
+
+添加或修改：
+
+```cpp
+node.attrs["role"] = "rowgroup";
+```
+
+判断属性是否存在：
+
+```cpp
+if (node.attrs.count("role") != 0) {
+    // 存在 role
+}
+```
+
+读取属性：
+
+```cpp
+auto it = node.attrs.find("role");
+
+if (it != node.attrs.end()) {
+    cout << it->second;
+}
+```
+
+删除属性：
+
+```cpp
+node.attrs.erase("role");
+```
+
+注意：
+
+```cpp
+node.attrs["role"]
+```
+
+如果 `role` 原本不存在，会自动插入一个空值。
+
+因此，**只想检查或读取时用 `find()`；想添加或修改时用 `[]`。**
+
+---
+
+**16．提取一个节点下的所有文本**
+
+下面的版本按顺序收集文本，并用空格连接：
+
+```cpp
+void collectText(const Node& node, string& result) {
+    if (node.tag == "script" ||
+        node.tag == "style" ||
+        node.tag == "template") {
         return;
     }
-    // 按孩子在 vector 中的先后顺序递归，保证文字顺序与源码相同。
-    // 本版只连接原有文本，不为 br/p/div 额外添加换行或分隔符。
-    for (const auto& child : node.children) appendCellText(*child, text);
-}
 
-// 仅用于显示：把换行、制表符等转义，保证一段文字只占一条输出记录。
-string displayText(const string& text) {
-    string result;
-    for (char c : text) {
-        // '\n' 是一个实际换行字符；"\\n" 是反斜杠和 n 两个显示字符。
-        if (c == '\n') result += "\\n";
-        else if (c == '\r') result += "\\r";
-        else if (c == '\t') result += "\\t";
-        else if (c == '\\') result += "\\\\";
-        else result += c;
-    }
-    return result;
-}
+    if (node.tag == "#text") {
+        if (!node.text.empty()) {
+            if (!result.empty()) {
+                result += ' ';
+            }
 
-// 寻找列节点，每列输出一条记录，多个文本节点合并，空列也保留。
-// rowindex 按值传递，因此一个分支修改行号不会影响其他兄弟分支。
-void printCells(const Node& node, string rowindex = "N/A") {
-    if (node.tag == "head" || node.tag == "script" || node.tag == "style") return;
+            result += node.text;
+        }
 
-    // find 返回迭代器；等于 end() 表示未找到，找到后 second 是属性值。
-    auto row = node.attributes.find("rowindex");
-    if (row != node.attributes.end()) rowindex = row->second;
-
-    // 只要当前标签自己带 colindex，就把它作为一个单元格处理。
-    auto col = node.attributes.find("colindex");
-    if (col != node.attributes.end()) {
-        string text; // 每个单元格使用自己的结果字符串，不能复用上一格的内容
-        appendCellText(node, text);
-        // 不判断 text 是否为空，因此 <div colindex="2"></div> 也会输出。
-        cout << "rowindex=" << displayText(rowindex)
-             << " colindex=" << displayText(col->second)
-             << " text=" << displayText(text) << '\n';
-        return; // 该列已整体输出，不再逐个输出它内部的孩子
+        return;
     }
 
-    // 还没找到列节点就继续向下搜索。
-    // *child 解引用智能指针，取得实际节点，传给引用参数。
-    for (const auto& child : node.children)
-        printCells(*child, rowindex);
-}
-
-int main(int argc, char* argv[]) {
-    // argc 是命令行参数数量；argv[0] 通常是程序名，argv[1] 是传入文件名。
-    try {
-        // 没传文件名时，读取当前工作目录的 test.html。
-        // VS 默认运行时可以把文件放在项目目录，并将工作目录设为 $(ProjectDir)。
-        ifstream file(argc > 1 ? argv[1] : "test.html", ios::binary);
-        // 打开失败时抛出异常，跳到下面的 catch，而不是继续解析空内容。
-        if (!file) throw runtime_error("Cannot open HTML file");
-        ostringstream buffer;
-        buffer << file.rdbuf(); // 把文件中剩余的全部内容读入字符串流
-        // str() 取出字符串；root 拥有完整树，离开 main 时自动释放全部节点。
-        auto root = parseHtml(buffer.str());
-        printCells(*root);
-        // 若没有任何带 colindex 的节点，本版不会输出记录。
-        return 0; // 返回 0 表示成功结束
-    } catch (const exception& e) {
-        // what() 提供错误说明；cerr 用于错误输出。
-        cerr << "Error: " << e.what() << '\n';
-        return 1; // 非 0 返回值表示执行失败
+    for (const auto& child : node.children) {
+        collectText(*child, result);
     }
 }
+```
+
+调用：
+
+```cpp
+string text;
+collectText(*col, text);
+```
+
+你原程序中的版本还进行了空白规范化和 HTML 实体解码。
+
+关键是：**先收集完整个 colindex 的文本，再输出一条 CSV 记录。** 不要每找到一个文本节点就输出一行。
+
+---
+
+**17．在指定位置插入子节点**
+
+在第 `pos` 个位置插入：
+
+```cpp
+size_t pos = 0;
+
+auto child = makeElement("span");
+
+if (pos <= root->children.size()) {
+    root->children.insert(
+        root->children.begin() + pos,
+        move(child)
+    );
+}
+```
+
+`pos == 0` 表示插入到最前面。
+
+`pos == children.size()` 表示插入到最后面。
+
+如果要保留节点地址：
+
+```cpp
+Node* ptr = child.get();
+
+root->children.insert(
+    root->children.begin() + pos,
+    move(child)
+);
+```
+
+---
+
+**18．删除一个子节点或整棵子树**
+
+删除第 `i` 个孩子：
+
+```cpp
+if (i < parent.children.size()) {
+    parent.children.erase(parent.children.begin() + i);
+}
+```
+
+由于该元素是 `unique_ptr<Node>`，删除时会自动释放：
+
+- 这个子节点；
+- 它的所有子节点；
+- 更深层的所有后代。
+
+删除最后一个孩子：
+
+```cpp
+if (!parent.children.empty()) {
+    parent.children.pop_back();
+}
+```
+
+删除所有孩子：
+
+```cpp
+parent.children.clear();
+```
+
+删除整棵树：
+
+```cpp
+root.reset();
+```
+
+删除后，指向被删除节点的普通指针全部失效：
+
+```cpp
+Node* ptr = root->children[0].get();
+
+root->children.clear();
+
+// ptr 已经悬空，不能再访问
+// cout << ptr->tag;  // 错误
+```
+
+---
+
+**19．遍历时删除孩子**
+
+不能在普通范围循环中随意 `erase()`，因为它会使迭代器失效。
+
+可以这样写：
+
+```cpp
+auto& children = parent.children;
+
+for (auto it = children.begin(); it != children.end();) {
+    if ((*it)->tag == "script") {
+        it = children.erase(it);
+    }
+    else {
+        ++it;
+    }
+}
+```
+
+`erase()` 返回删除位置后面的新迭代器。
+
+这里删除的是父节点的直接孩子；如果要删除所有层的匹配节点，还需要递归处理保留下来的子树。
+
+---
+
+**20．把子树取出来，暂时不删除**
+
+有时你想把节点从原父节点移走，但保留整个子树：
+
+```cpp
+unique_ptr<Node> detachChild(Node& parent, size_t index) {
+    if (index >= parent.children.size()) {
+        return nullptr;
+    }
+
+    // 先取得所有权
+    auto subtree = move(parent.children[index]);
+
+    // 再删除已经为空的容器元素
+    parent.children.erase(parent.children.begin() + index);
+
+    return subtree;
+}
+```
+
+调用：
+
+```cpp
+auto subtree = detachChild(parent, 0);
+```
+
+此时：
+
+- 子树已经不属于原父节点；
+- 子树没有被删除；
+- `subtree` 接管了它的所有权。
+
+如果 `subtree` 离开作用域前没有交给别人，子树就会自动释放。
+
+---
+
+**21．把子树移动到另一个父节点下**
+
+```cpp
+auto subtree = detachChild(oldParent, 0);
+
+if (subtree) {
+    newParent.children.push_back(move(subtree));
+}
+```
+
+移动的是整棵子树，所有后代都会一起保留。
+
+必须保证：**`newParent` 不是被移动子树内部的节点。** 否则会破坏树的结构和所有权关系。
+
+对于你的 HTML 解析器，目前只需要添加节点，一般用不到这个操作。
+
+---
+
+**22．替换一个子节点**
+
+```cpp
+if (i < parent.children.size()) {
+    parent.children[i] = makeElement("section");
+}
+```
+
+原来第 `i` 个孩子及其整棵子树会被释放，新节点占据原来的位置。
+
+如果需要保留旧子树：
+
+```cpp
+auto oldSubtree = move(parent.children[i]);
+
+parent.children[i] = makeElement("section");
+```
+
+这样旧子树由 `oldSubtree` 管理。
+
+---
+
+**23．复制整棵树：需要“深拷贝”**
+
+不能直接写：
+
+```cpp
+auto copy = root;  // 错误：unique_ptr 不能复制
+```
+
+下面也不是复制树：
+
+```cpp
+auto copy = move(root);  // 转移所有权，root 会变为空
+```
+
+真正复制需要为每个节点创建一个新对象：
+
+```cpp
+unique_ptr<Node> cloneTree(const Node& source) {
+    auto copy = make_unique<Node>();
+
+    copy->tag = source.tag;
+    copy->text = source.text;
+    copy->attrs = source.attrs;
+
+    for (const auto& child : source.children) {
+        copy->children.push_back(cloneTree(*child));
+    }
+
+    return copy;
+}
+```
+
+调用：
+
+```cpp
+auto copiedRoot = cloneTree(*root);
+```
+
+现在得到两棵独立的树，修改一棵不会影响另一棵。
+
+---
+
+**24．访问父节点**
+
+你目前的 `Node` 只保存孩子，**不能直接通过节点找到父亲**。
+
+有两种常用方法。
+
+第一种是在解析过程中用栈保存路径：
+
+```cpp
+vector<Node*> stack{ root.get() };
+```
+
+如果栈中至少有两个节点：
+
+```cpp
+Node* current = stack.back();
+Node* parent = stack[stack.size() - 2];
+```
+
+这里的栈必须一直保持“根到当前节点的路径”这一含义。普通 DFS 中保存待处理节点的栈，不一定具有这个性质。
+
+第二种是在 `Node` 中增加父节点指针：
+
+```cpp
+struct Node {
+    string tag;
+    string text;
+    map<string, string> attrs;
+
+    Node* parent = nullptr;
+    vector<unique_ptr<Node>> children;
+};
+```
+
+添加孩子时设置：
+
+```cpp
+child->parent = &parent;
+
+parent.children.push_back(move(child));
+```
+
+之后就能访问：
+
+```cpp
+if (node.parent != nullptr) {
+    cout << node.parent->tag;
+}
+```
+
+父节点指针用普通指针即可。**孩子不负责管理父节点的生命周期。**
+
+如果增加了 `parent`，移动子树、取出子树和复制树时，也必须相应更新这个指针。
+
+---
+
+**25．函数应该接收和返回什么类型**
+
+这是最值得记住的一张表：
+
+| 目的 | 常用写法 | 是否转移所有权 |
+|---|---|---|
+| 只读一个已有节点 | `void f(const Node& node)` | 否 |
+| 修改一个已有节点 | `void f(Node& node)` | 否 |
+| 接收一个可能为空的节点 | `void f(Node* node)` | 否 |
+| 接收并管理一棵子树 | `void f(unique_ptr<Node> node)` | 是 |
+| 查找已有节点 | `Node* find(Node& root)` | 否 |
+| 创建并返回新树 | `unique_ptr<Node> create()` | 是 |
+| 返回计算结果 | `size_t count(const Node& node)` | 否 |
+
+例如：
+
+```cpp
+unique_ptr<Node> createTree() {
+    auto root = makeElement("#document");
+    return root;
+}
+```
+
+这里直接写：
+
+```cpp
+return root;
+```
+
+即可，C++ 会通过返回值优化或移动传递所有权。
+
+但不能返回局部节点对象的地址：
+
+```cpp
+Node* wrong() {
+    Node node;
+    return &node;  // 错误：函数结束后 node 已销毁
+}
+```
+
+---
+
+**26．`vector` 扩容后，节点地址会不会变化？**
+
+你的结构是：
+
+```cpp
+vector<unique_ptr<Node>> children;
+```
+
+当 `vector` 扩容时，内部的 `unique_ptr` 元素可能被移动，但它们管理的 **`Node` 对象不会因此移动**。
+
+因此：
+
+```cpp
+Node* ptr = parent.children[0].get();
+
+parent.children.push_back(makeElement("span"));
+```
+
+只要原节点没有被删除，`ptr` 仍然有效。
+
+但是，指向 `vector` 元素本身的迭代器或引用可能失效：
+
+```cpp
+auto it = parent.children.begin();
+
+parent.children.push_back(makeElement("span"));
+
+// 如果发生扩容，就不能再使用旧 it
+```
+
+要区分：
+
+- `Node*`：指向独立分配的节点。
+- `vector` 迭代器：指向容器中的智能指针元素。
+
+---
+
+**27．回到你的 `parseHTML()`：核心操作其实只有这几步**
+
+创建整棵树的根，并记录当前位置：
+
+```cpp
+auto root = makeElement("#document");
+
+vector<Node*> stack{ root.get() };
+```
+
+遇到开始标签时：
+
+```cpp
+// 1. 创建新节点
+auto n = makeElement(tag);
+
+// 2. 记录它的地址
+Node* ptr = n.get();
+
+// 3. 将它交给当前父节点
+stack.back()->children.push_back(move(n));
+
+// 4. 对于需要进入内部解析的标签，将它压入路径栈
+stack.push_back(ptr);
+```
+
+遇到结束标签时，退回父节点。假设结束标签与栈顶匹配：
+
+```cpp
+if (stack.size() > 1) {
+    stack.pop_back();
+}
+```
+
+注意：**`pop_back()` 这里只是从路径栈中移除一个普通指针，不会删除树中的节点。**
+
+遇到文本时：
+
+```cpp
+auto n = makeText(text);
+
+stack.back()->children.push_back(move(n));
+```
+
+文本节点没有需要继续解析的孩子，所以不用压入路径栈。
+
+最后：
+
+```cpp
+return root;
+```
+
+返回整棵构建好的树。
+
+你可以先重点记住下面五种操作：
+
+```cpp
+make_unique<Node>()                  // 创建节点
+
+n.get()                              // 获取节点地址
+
+parent.children.push_back(move(n))   // 将节点交给父节点
+
+stack.push_back(ptr)                 // 进入节点
+
+stack.pop_back()                     // 退出节点，返回上一层
+```
+
+**树中的 `children` 保存结构和所有权；解析用的 `stack` 记录当前走到了哪里。** 这是你这份程序中最核心的关系。
