@@ -1118,3 +1118,535 @@ stack.pop_back()                     // 退出节点，返回上一层
 ```
 
 **树中的 `children` 保存结构和所有权；解析用的 `stack` 记录当前走到了哪里。** 这是你这份程序中最核心的关系。
+
+
+
+
+
+这段代码主要做两件事：
+
+1. **解析开始标签中的所有属性，保存到新节点 `n` 中。**
+2. **把新节点 `n` 加入当前父节点的 `children`。**
+
+我们用一个具体例子，从头跟着代码走：
+
+```html
+<div role="rowgroup" aria-rowindex="2" hidden>
+```
+
+假设前面的代码已经创建了新节点，并提取了标签名：
+
+```cpp
+auto n = make_unique<Node>();
+n->tag = "div";
+```
+
+此时：
+
+```cpp
+token = "div role=\"rowgroup\" aria-rowindex=\"2\" hidden";
+```
+
+这里字符串中的 `\"` 只是 C++ 表示双引号的写法，实际内容是：
+
+```html
+div role="rowgroup" aria-rowindex="2" hidden
+```
+
+**`p` 已经位于标签名 `div` 后面，准备开始读取属性。**
+
+---
+
+**① 外层循环：逐个读取属性**
+
+```cpp
+while (p < token.size()) {
+```
+
+只要 `p` 还没有到字符串末尾，就继续读取下一个属性。
+
+在这个例子中，循环会依次处理：
+
+```html
+role="rowgroup"
+aria-rowindex="2"
+hidden
+```
+
+每次循环负责一个属性。
+
+---
+
+**② 跳过属性前面的空白或 `/`**
+
+```cpp
+while (p < token.size() &&
+       (ws(token[p]) || token[p] == '/'))
+    ++p;
+```
+
+例如当前剩余内容是：
+
+```html
+ role="rowgroup"
+```
+
+首先跳过开头的空格，让 `p` 指向 `r`。
+
+这里也跳过 `/`，用于处理标签末尾可能出现的自闭合标记：
+
+```html
+<input hidden />
+```
+
+`++p` 的意思是：**向后移动一个字符。**
+
+---
+
+**③ 记录属性名的起点，寻找终点**
+
+```cpp
+start = p;
+```
+
+记住属性名开始的位置。例如现在指向 `role` 中的 `r`。
+
+```cpp
+while (p < token.size() &&
+       !ws(token[p]) &&
+       token[p] != '=' &&
+       token[p] != '/')
+    ++p;
+```
+
+不断往后走，直到遇到：
+
+- 字符串末尾；
+- 空白字符；
+- `=`；
+- `/`。
+
+对于：
+
+```html
+role="rowgroup"
+```
+
+`p` 最后停在 `=` 上。
+
+因此，从 `start` 到 `p` 前面的内容就是：
+
+```text
+role
+```
+
+---
+
+**④ 如果没有读到属性名，就跳过当前位置**
+
+```cpp
+if (p == start) {
+    if (p < token.size())
+        ++p;
+
+    continue;
+}
+```
+
+`p == start` 表示刚才扫描属性名时，一步都没走，属性名长度为零。
+
+例如在格式异常的标签里，当前位置直接就是：
+
+```text
+=
+```
+
+它不能作为这段程序中的属性名开头，因此跳过一个字符，再进行下一次循环。
+
+这里：
+
+```cpp
+continue;
+```
+
+表示**跳过本次循环剩余代码，回到外层 `while` 的条件判断**。
+
+这一步主要用于避免程序一直卡在同一个字符上。
+
+---
+
+**⑤ 提取属性名，并准备保存属性值**
+
+```cpp
+string key = lower(token.substr(start, p - start)), value;
+```
+
+这其实同时声明了两个字符串，拆开更清楚：
+
+```cpp
+string key = lower(token.substr(start, p - start));
+
+string value;
+```
+
+其中：
+
+```cpp
+token.substr(start, p - start)
+```
+
+表示从 `start` 开始，截取长度为 `p - start` 的字符串。
+
+对于当前例子：
+
+```cpp
+key = "role";
+value = "";
+```
+
+`lower()` 将属性名转为小写，因此：
+
+```html
+ROLE="rowgroup"
+```
+
+也会使用：
+
+```cpp
+key = "role";
+```
+
+注意：**这里转小写的是属性名，属性值没有因此转小写。**
+
+---
+
+**⑥ 跳过属性名与等号之间的空格**
+
+```cpp
+while (p < token.size() && ws(token[p]))
+    ++p;
+```
+
+这是为了同时支持：
+
+```html
+role="rowgroup"
+```
+
+和：
+
+```html
+role   = "rowgroup"
+```
+
+无论中间有没有空格，都让 `p` 尽量移动到 `=` 的位置。
+
+---
+
+**⑦ 如果有 `=`，就开始读取属性值**
+
+```cpp
+if (p < token.size() && token[p] == '=') {
+```
+
+判断当前字符是否为等号。
+
+有等号：
+
+```html
+role="rowgroup"
+```
+
+就读取后面的值。
+
+没有等号：
+
+```html
+hidden
+```
+
+就不进入这个 `if`，让 `value` 保持为空字符串。
+
+```cpp
+++p;
+```
+
+先跳过 `=`。
+
+```cpp
+while (p < token.size() && ws(token[p]))
+    ++p;
+```
+
+再跳过等号后面的空格。
+
+例如：
+
+```html
+role =   "rowgroup"
+```
+
+此时 `p` 会停在开头的双引号上。
+
+---
+
+**⑧ 属性值带引号时，读取引号之间的内容**
+
+```cpp
+if (p < token.size() &&
+    (token[p] == '\'' || token[p] == '"')) {
+```
+
+判断属性值是否以单引号或双引号开头：
+
+```html
+role="rowgroup"
+role='rowgroup'
+```
+
+接下来这句：
+
+```cpp
+char q = token[p++];
+```
+
+等价于：
+
+```cpp
+char q = token[p];  // 记录引号类型
+++p;               // 跳过开头引号
+```
+
+对于：
+
+```html
+role="rowgroup"
+```
+
+此时：
+
+```cpp
+q = '"';
+```
+
+而 `p` 已经移动到 `rowgroup` 的 `r`。
+
+```cpp
+start = p;
+```
+
+记录属性值的开始位置。
+
+```cpp
+while (p < token.size() && token[p] != q)
+    ++p;
+```
+
+继续向后找，直到遇到相同类型的结束引号。
+
+```cpp
+value = token.substr(start, p - start);
+```
+
+取出引号之间的内容：
+
+```cpp
+value = "rowgroup";
+```
+
+最后：
+
+```cpp
+if (p < token.size())
+    ++p;
+```
+
+跳过结束引号，让后续代码可以读取下一个属性。
+
+这一部分完整展开是：
+
+```cpp
+char q = token[p];
+++p;
+
+start = p;
+
+while (p < token.size() && token[p] != q) {
+    ++p;
+}
+
+value = token.substr(start, p - start);
+
+if (p < token.size()) {
+    ++p;
+}
+```
+
+---
+
+**⑨ 属性值不带引号时，读取到空白或末尾**
+
+```cpp
+else {
+    start = p;
+
+    while (p < token.size() && !ws(token[p]))
+        ++p;
+
+    value = token.substr(start, p - start);
+}
+```
+
+它处理这样的写法：
+
+```html
+aria-rowindex=2 role=row
+```
+
+例如读取 `aria-rowindex=2` 时：
+
+```cpp
+key = "aria-rowindex";
+value = "2";
+```
+
+因为没有引号，所以使用空白或字符串末尾判断属性值在哪里结束。
+
+---
+
+**⑩ 将这个属性保存到新节点中**
+
+```cpp
+n->attrs.emplace(key, decode(value));
+```
+
+你的节点中有：
+
+```cpp
+map<string, string> attrs;
+```
+
+所以这句就是向属性表中插入一对“属性名—属性值”。
+
+例如：
+
+```cpp
+key = "role";
+value = "rowgroup";
+```
+
+执行后，节点中就保存了：
+
+```cpp
+n->attrs["role"] == "rowgroup";
+```
+
+`decode()` 用来还原 HTML 实体，例如：
+
+```html
+title="A &amp; B"
+```
+
+保存的值是：
+
+```text
+A & B
+```
+
+`emplace()` 遇到已经存在的属性名时，不会覆盖之前的值。
+
+随后回到外层循环，继续解析下一个属性。
+
+对于我们开头的例子，循环结束后，`n` 中保存的是：
+
+| 成员或属性 | 值 |
+|---|---|
+| `n->tag` | `"div"` |
+| `n->attrs["role"]` | `"rowgroup"` |
+| `n->attrs["aria-rowindex"]` | `"2"` |
+| `n->attrs["hidden"]` | `""` |
+
+到这里，**新节点的属性已经填好了，但还没有加入树中。**
+
+---
+
+**⑪ 保存新节点的地址**
+
+```cpp
+Node* ptr = n.get();
+```
+
+`n` 是：
+
+```cpp
+unique_ptr<Node>
+```
+
+而 `ptr` 是：
+
+```cpp
+Node*
+```
+
+它们指向同一个节点。
+
+这句只是记录地址，没有复制节点，也没有转移所有权。后续需要把新节点压入解析栈时，就可以使用 `ptr`。
+
+---
+
+**⑫ 把新节点加入当前父节点**
+
+```cpp
+stack.back()->children.push_back(move(n));
+```
+
+分开理解：
+
+```cpp
+stack.back()
+```
+
+取得栈顶指针，即当前父节点。
+
+```cpp
+stack.back()->children
+```
+
+取得父节点的子节点列表。
+
+```cpp
+push_back(move(n))
+```
+
+将新节点加入这个列表，并把所有权交给父节点。
+
+例如正在解析：
+
+```html
+<body>
+    <div role="rowgroup">
+```
+
+此时：
+
+```cpp
+stack.back()->tag == "body";
+n->tag == "div";
+```
+
+执行后，`div` 就成为 `body` 的子节点。
+
+| 执行后 | 状态 |
+|---|---|
+| `n` | 变为空指针 |
+| 新建的 `div` 节点 | 仍然存在，由父节点的 `children` 管理 |
+| `ptr` | 仍然指向这个 `div` 节点 |
+| `stack.back()` | 仍然指向 `body` |
+
+**最后一点尤其要注意：加入 `children` 并不会自动改变栈顶。** 后面还要执行：
+
+```cpp
+stack.push_back(ptr);
+```
+
+才表示进入新节点内部，开始向它添加孩子。
